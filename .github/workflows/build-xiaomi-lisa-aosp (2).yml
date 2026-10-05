@@ -1,0 +1,363 @@
+name: Build Xiaomi 11 Lite 5G NE (lisa) (HyperOS 2 / Android 14)
+
+# ============================================================================
+# 设备：Xiaomi 11 Lite 5G NE / codename lisa / SM7325 (Snapdragon 778G) / Linux 5.4
+# ROM ：Android 14 + HyperOS 2
+# Root：ReSukiSU + SUSFS
+#
+# 内核源（默认，路线 B）：LineageOS/android_kernel_xiaomi_sm8350 @ lineage-21
+#   · lineage-21 = Android 14 基线，与 A14 的 ROM 匹配（该仓库默认分支是 lineage-23.2/A16，
+#     用在 A14 ROM 上不合适）
+#   · LineageOS wiki 给 lisa 指定的内核仓库就是它（android_kernel_xiaomi_sm8350）
+#   · 它有 vendor DT 树（arch/arm64/boot/dts/vendor/qcom），能编出 yupik.dtb 与 lisa 的 .dtbo
+#   · 它有完整的 arch/arm64/configs/vendor/lahaina-qgki_defconfig（24 KB），
+#     外加 vendor/lisa_QGKI.config + vendor/xiaomi_QGKI.config 两个设备片段
+#   · 这套「完整 QGKI defconfig + 设备片段」与上游项目现成的 Mi 11(venus) 工作流同构
+#
+# 放置位置：<你的 fork>/.github/workflows/build-xiaomi-lisa-aosp.yml
+# 触发方式：Actions 页面手动 Run workflow（本文件自带 workflow_dispatch，
+#           不需要改 build-kernel.yml 那个 20 机型汇总）
+#
+# 想换回 MiCode 官方 A11 树？见文件末尾注释里的路线 A（不推荐用在 A14 上）。
+# ============================================================================
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  # ===================== 设备 =====================
+  DEVICE_NAME : "xiaomi_11_lite_5g_ne"
+  DEVICE_CODENAME : "lisa"
+
+  # 与同族 5.4 机型（Mi 11 / venus、Redmi Note 11 Pro 5G / veux）一致的混合工具链：
+  # clang 编译 + android GCC 4.9 的 binutils + lld 链接。
+  # 这套组合在本项目多个 5.4 lahaina 机型上标为 Stable。
+  # 若编译报 clang 版本类错误（内置错误分析器会直接点名），再按 README 换新 clang。
+  CUSTOM_CMDS : "CLANG_TRIPLE=aarch64-linux-gnu-"
+  EXTRA_CMDS : "LD=ld.lld"
+
+  KERNEL_SOURCE : "https://github.com/LineageOS/android_kernel_xiaomi_sm8350.git"
+  KERNEL_BRANCH : "lineage-21" # A14 基线；不要用默认的 lineage-23.2
+
+  # clang 12（r416183b）与这一代 msm-5.4 树匹配；同项目 venus/veux 用的就是它
+  CLANG_SOURCE : "https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git"
+  CLANG_BRANCH : "lineage-20.0"
+
+  GCC_GNU : false
+  GCC_64_SOURCE : "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9.git"
+  GCC_64_BRANCH : "android12L-release"
+  GCC_32_SOURCE : "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9.git"
+  GCC_32_BRANCH : "android12L-release"
+
+  # ===================== defconfig =====================
+  # 路线 B 用现成的完整 QGKI defconfig，再按顺序合并两个设备片段。
+  # 顺序很重要：后合并的覆盖先合并的（官方脚本注释也强调 base → GKI → QGKI → debug）。
+  DEFCONFIG_SOURCE: ""
+  DEFCONFIG_NAME : "vendor/lahaina-qgki_defconfig"
+  DEFCONFIG_ORIGIN_IMAGE: ""
+  DEFCONFIG_FROM_BOOT: false
+
+  # ===================== KernelSU / SUSFS =====================
+  KERNELSU_SOURCE : ""
+  KERNELSU_BRANCH : ""
+
+  KERNELSU_AUTO_GET : "true"
+  KERNELSU_AUTO_FORK : "resukisu" # xxksu, rsuntk, next, resukisu and sukisu
+
+  SUSFS_ENABLE : true
+  # 官方补丁库（NonGKI_Kernel_Patches）目前没有任何 lisa 目录，先关掉克隆。
+  # 以后自己做了 lisa 修正补丁，再打开并填下面两项。
+  SUSFS_FIXED : false
+
+  # ===================== 打包 =====================
+  # lisa 专用 AnyKernel3：devicecheck=lisa、boot + vendor_boot 双分区、do.modules=1。
+  # 用 osm0sis 通用分支只能刷 boot，模块会落到错位置。
+  # 注：该仓库现已被重定向到 adithya2306/AnyKernel3（分支 lisa 仍在，raw/git 均可用）。
+  AK3_SOURCE : "https://github.com/ghostrider-reborn/AnyKernel3.git"
+  AK3_BRANCH : "lisa"
+
+  BOOT_SOURCE : ""
+
+  NEED_DTBO : false
+  NEED_SAFE_DTBO : false
+
+  ROM_TEXT : "hyperos2_a14"
+
+  # ===================== 其它 =====================
+  PYTHON_VERSION: "3" # Only 2(Ubuntu 22.04 and Ubuntu 20.04) or 3(Any OS Versions).
+
+  PACK_METHOD: "AnyKernel3" # AnyKernel3 need SOURCE and BRANCH, MKBOOTIMG needn't it.
+  # 5.4 QGKI 树里 WiFi 等是模块，且 lisa 的 AK3 里写着 do.modules=1：
+  # 若 zip 里的 modules/ 为空，安装器 cd 失败后会把整个 AK3 目录当成模块推入系统，
+  # 所以这一项必须是 true，并且下面的 Staging 步骤会强制校验 .ko 非空。
+  PACK_KMODULES: "true"
+
+  KERNELSU_METHOD: "shell" # shell, manual and only.
+
+  PATCHES_SOURCE: "JackA1ltman/NonGKI_Kernel_Patches"
+  PATCHES_BRANCH: "mi_kernel"
+
+  SUSFS_FOLDER_FIXED: "" # 以后有了就填 -> lisa_hyperos2_a14_54
+  SUSFS_PATCH_FIXED: ""  # 多个用逗号分隔 -> patch1,patch2
+
+  REKERNEL_ENABLE: "false"
+  DROIDSPACES_ENABLE: "false"
+  NOMOUNT_ENABLE: "false"
+
+  HOOK_METHOD: "syscall" # 提醒：SUSFS_ENABLE=true 时框架强制走 inline hook，本项会被忽略
+
+  KPM_ENABLE: "false"
+  KPM_INLINE: "false"
+  KPM_KPATCH_NEXT: "false"
+  KPM_PATCH_SOURCE: "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/refs/heads/main/kpm/patch_linux"
+
+  BASEBAND_GUARD_ENABLE: "false"
+  BASEBAND_GUARD_BOOT: "false"
+
+  GENERATE_DTB: "false" # dtb 由下面的 Staging 步骤显式处理，不用框架的自动拼接
+  GENERATE_CHIP: "qcom"
+
+  # 首次移植：BUILD_DEBUGGER=true 便于失败时拿到 error.log / .rej 工件；
+  # SKIP_PATCH=true 让 SUSFS 打歪也不中断（先拿到能编过的产物）。
+  # 跑通后把 SKIP_PATCH 改成 "false" 启用严格模式。
+  BUILD_DEBUGGER: "true"
+  SKIP_PATCH: "true"
+
+  BUILD_OTHER_CONFIG: "true"
+  MERGE_CONFIG_FILES: "vendor/lisa_QGKI.config,vendor/xiaomi_QGKI.config"
+
+  FREE_MORE_SPACE: "true"
+
+jobs:
+  build-kernel:
+    name: Xiaomi 11 Lite 5G NE (lisa) (HyperOS 2 / Android 14)
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+      - name: ⏰ Checkout repository
+        uses: actions/checkout@v6
+
+      - name: ⌛️ Compilation environment preparation
+        uses: ./.github/workflows/build-env
+
+      - name: ⚙️ Get necessary tools
+        uses: ./.github/workflows/build-ready
+
+      - name: 🪝 Patch Kernel of SUSFS
+        uses: ./.github/workflows/patch-susfs
+
+      - name: 🔗 Patch for no-kprobe
+        uses: ./.github/workflows/patch-no-kprobe
+
+      - name: 🪛 Extra Kernel Options
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/device_kernel
+          DEFCONFIG="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+
+          echo "===== 1) defconfig 基座检查 / 片段预处理 ====="
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "❌ 找不到 $DEFCONFIG —— 路线 B 需要该文件（LineageOS 树里是 24 KB 的完整 QGKI defconfig）"
+            exit 1
+          fi
+          if [ "${{ env.DEFCONFIG_NAME }}" = "gki_defconfig" ]; then
+            # 仅路线 A（MiCode A11 树）需要：官方 generate_defconfig.sh 会先把
+            # <平台>_GKI.config 里的 "=m" 全 sed 成 "=y"，再合并。
+            if [ ! -s arch/arm64/configs/vendor/lisa_ALLYES_GKI.config ]; then
+              if [ -f scripts/gki/fragment_allyesconfig.sh ]; then
+                bash scripts/gki/fragment_allyesconfig.sh \
+                  arch/arm64/configs/vendor/lisa_GKI.config \
+                  arch/arm64/configs/vendor/lisa_ALLYES_GKI.config || true
+              fi
+              if [ ! -s arch/arm64/configs/vendor/lisa_ALLYES_GKI.config ]; then
+                sed 's/=m$/=y/g' arch/arm64/configs/vendor/lisa_GKI.config \
+                  > arch/arm64/configs/vendor/lisa_ALLYES_GKI.config
+              fi
+              echo "[+] 已生成 vendor/lisa_ALLYES_GKI.config"
+            fi
+          else
+            echo "[+] 使用现成 defconfig，无需生成 ALLYES 片段"
+          fi
+
+          echo "===== 2) 追加 KernelSU / HyperOS 需要的配置 ====="
+          # CONFIG_TMPFS_XATTR：KernelSU 系模块挂载与 SUSFS 在部分 ROM 上需要；
+          # 同项目 Redmi Note 11 Pro 5G(veux, 5.4) 的机型专属步骤里也补了这一项。
+          for CFG in CONFIG_TMPFS_XATTR=y; do
+            KEY="${CFG%%=*}"
+            if grep -q "^${KEY}=" "$DEFCONFIG"; then
+              sed -i "s/^${KEY}=.*/${CFG}/" "$DEFCONFIG"
+            else
+              echo "$CFG" >> "$DEFCONFIG"
+            fi
+            echo "[+] $CFG"
+          done
+
+          echo "===== 3) DT 树探测 ====="
+          if [ -d arch/arm64/boot/dts/vendor ]; then
+            echo "[+] 存在 vendor DT 树，打开 DT overlay 以便编出 .dtbo"
+            grep -q '^CONFIG_BUILD_ARM64_DT_OVERLAY=y' "$DEFCONFIG" \
+              || echo 'CONFIG_BUILD_ARM64_DT_OVERLAY=y' >> "$DEFCONFIG"
+          else
+            echo "::warning title=缺少 vendor DT 树::本分支没有 arch/arm64/boot/dts/vendor，将编不出 yupik.dtb 与 lisa 的 .dtbo；产物只会替换 boot 里的内核，vendor_boot 的 dtb 与 dtbo 分区保持 ROM 原样。想要完整产物请改用 LineageOS 树。"
+            # 不主动打开 CONFIG_BUILD_ARM64_DT_OVERLAY：没有 .dtbo 输入时可能让 dtbo.img 规则报错
+          fi
+
+          echo "===== 4) 放开 AK3 的 Android 版本闸门（A14 必需） ====="
+          # lisa 的 AK3 里写死 supported.versions=11.0-13.0，会在 Android 14 的 ROM 上
+          # 直接 abort "Unsupported Android version"；置空即关闭该检查
+          # （设备名检查 device.name1=lisa 保留，仍能防止刷错机型）
+          for AK3 in "$GITHUB_WORKSPACE/device_kernel/AnyKernel3" "$GITHUB_WORKSPACE/AnyKernel3"; do
+            if [ -f "$AK3/anykernel.sh" ]; then
+              sed -i 's/^supported\.versions=.*/supported.versions=/' "$AK3/anykernel.sh"
+              echo "[+] 已放开版本闸门: $AK3/anykernel.sh"
+              AK3_PATCHED=1
+            fi
+          done
+          [ -n "$AK3_PATCHED" ] || echo "::warning title=没找到 AnyKernel3::build-ready 应该已经把 AK3 克隆到 device_kernel/AnyKernel3，这里没找到；若稍后 pack-process 报错请检查 AK3_SOURCE/AK3_BRANCH"
+
+          echo "===== 5) 加固 AK3：Magisk 配置导出不再因非法变量名报错 ====="
+          # ak3-core.sh 第 342 行原文是：export $(cat .magisk);
+          # 它把 Magisk 配置文件的每个词都当变量名，未加引号的词分割遇到带括号/空格的值
+          # （例如 MAGISK_VER=27.0 (27000)）就会让 busybox ash 报
+          #   "anykernel.sh: export: line 342: (a): bad variable name"
+          # 改成逐行、带引号导出：语义等价，且不再产生这行报错。
+          # 为什么必须修：export 是 POSIX「特殊内建命令」，它失败会让【非交互 shell 直接退出】
+          # （AK3 本身并没有 set -e，但 ash 对特殊内建命令的失败会终止整个脚本）。
+          # 实测后果：脚本死在 write_boot 中途 → update-binary 返回非零 → 刷机 App 报失败，
+          # 且 boot 分区还没被写（手机照常开机、新内核未生效）。
+          # 末尾再挂 2>/dev/null || true，确保这一行在任何情况下都不会返回非零。
+          for AK3 in "$GITHUB_WORKSPACE/device_kernel/AnyKernel3" "$GITHUB_WORKSPACE/AnyKernel3"; do
+            [ -f "$AK3/tools/ak3-core.sh" ] || continue
+            if grep -q 'export \$(cat \.magisk);' "$AK3/tools/ak3-core.sh"; then
+              sed -i 's#export \$(cat \.magisk);#while IFS= read -r _ml; do case "$_ml" in [A-Za-z_]*=*) export "$_ml" 2>/dev/null;; esac; done < .magisk 2>/dev/null || true;#' "$AK3/tools/ak3-core.sh"
+              echo "[+] ak3-core.sh 已加固："
+              grep -n 'while IFS= read -r _ml' "$AK3/tools/ak3-core.sh" | sed 's/^/    /'
+            else
+              echo "[!] 未找到目标行（AK3 上游可能已修），跳过：$AK3/tools/ak3-core.sh"
+            fi
+          done
+
+      - name: 🧰 Patch Kernel of Re:Kernel
+        uses: ./.github/workflows/patch-rekernel
+
+      - name: 💿 Patch Kernel of Droidspaces
+        uses: ./.github/workflows/patch-droidspaces
+
+      - name: 🔒 Patch Kernel of Baseband Guard
+        uses: ./.github/workflows/patch-baseband-guard
+
+      - name: 🛡️ Patch Kernel of NoMount
+        uses: ./.github/workflows/patch-nomount
+
+      - name: ❌ Set Swap
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: 🚀 Build Process
+        uses: ./.github/workflows/build-process
+
+      # ------------------------------------------------------------------
+      # 机型适配的核心：把 AK3(lisa) 期望的 dtb / dtbo.img 放到 pack-process
+      # 会去取的 out/arch/arm64/boot/ 下，并确保 .ko 非空。
+      # AK3 的实际行为（已读 tools/ak3-core.sh + update-binary 核实）：
+      #   · zip 根目录的 dtb  -> 作为 vendor_boot 的 dtb 覆盖（setup_ak 会把它移进
+      #                          vendor_boot-files，仅在刷 vendor_boot 时使用）
+      #   · zip 根目录的 dtbo.img -> write_boot 里的 flash_generic dtbo 会刷进 dtbo 分区
+      #   · modules/ 下的文件按“相对根路径”复制，不需要 modules.dep/load 之类的元数据
+      # ------------------------------------------------------------------
+      - name: 🔍 Stage dtb / dtbo / check modules
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/device_kernel
+          BOOT=out/arch/arm64/boot
+
+          echo "===== 1) dtb ====="
+          # 注意：GitHub 的 run 步骤默认带 -eo pipefail，find | head 会因 SIGPIPE 让整步失败，
+          # 所以这里用 -print -quit 而不是管道
+          DTB_SRC=$(find out/arch/arm64/boot/dts -name 'yupik.dtb' -print -quit)
+          [ -n "$DTB_SRC" ] || DTB_SRC=$(find out/arch/arm64/boot/dts -name 'lisa*.dtb' -print -quit)
+          if [ -n "$DTB_SRC" ]; then
+            rm -f "$BOOT/dtb.img"   # 让 pack-process 用我们指定的单文件 dtb
+            cp -f "$DTB_SRC" "$BOOT/dtb"
+            echo "✅ dtb <- $DTB_SRC"
+          elif [ -f "$BOOT/dtb.img" ]; then
+            echo "✅ 未找到单个 dtb，沿用内核自建的 dtb.img（pack-process 会把它当 dtb 打包）"
+          else
+            echo "::warning title=没有 dtb 可打包::out/ 下既没有 yupik.dtb 也没有 dtb.img。zip 将不含 dtb，刷入时 vendor_boot 的 dtb 保持 ROM 原样。"
+            find out/arch/arm64/boot/dts -name '*.dtb' 2>/dev/null | head -20 || true
+          fi
+
+          echo "===== 2) dtbo.img ====="
+          DTBO_FILES=$(find "$BOOT/dts" -name 'lisa-*overlay*.dtbo' 2>/dev/null | sort || true)
+          [ -n "$DTBO_FILES" ] || DTBO_FILES=$(find "$BOOT/dts" -name '*lisa*overlay*.dtbo' 2>/dev/null | sort || true)
+          if [ -n "$DTBO_FILES" ]; then
+            rm -f "$BOOT/dtbo.img"
+            if command -v mkdtimg >/dev/null 2>&1; then
+              mkdtimg create "$BOOT/dtbo.img" --page_size=4096 $DTBO_FILES
+            elif [ -x tools/mkdtimg ]; then
+              ./tools/mkdtimg create "$BOOT/dtbo.img" --page_size=4096 $DTBO_FILES
+            else
+              echo "❌ 找不到 mkdtimg（build-env 应已安装 /usr/bin/mkdtimg）"; exit 1
+            fi
+            echo "✅ dtbo.img 由以下 overlay 组成："
+            echo "$DTBO_FILES"
+          elif [ -f "$BOOT/dtbo.img" ]; then
+            echo "✅ 未按名字找到 overlay，沿用内核自建的 dtbo.img"
+          else
+            echo "::warning title=没有 dtbo 可打包::out/ 下没有 lisa 的 overlay .dtbo，也没有 dtbo.img。zip 将不含 dtbo.img，dtbo 分区保持 ROM 原样。"
+            find out/arch/arm64/boot/dts -name '*.dtbo' 2>/dev/null | head -20 || true
+          fi
+
+          echo "===== 3) 内核模块（必须非空） ====="
+          if grep -q '^CONFIG_MODULES=y' out/.config; then
+            if [ -z "$(find out -name '*.ko' -print -quit)" ]; then
+              echo "[!] out/ 下没有 .ko，补跑 make modules"
+              export PATH="$GITHUB_WORKSPACE/clang-custom/bin:$PATH"
+              make -j$(nproc --all) O=out ARCH=arm64 CC="ccache clang" \
+                ${{ env.CUSTOM_CMDS }} ${{ env.EXTRA_CMDS }} modules
+            fi
+            KO_COUNT=$(find out -name '*.ko' | wc -l)
+            echo "[+] out/ 下 .ko 数量：$KO_COUNT"
+            [ "$KO_COUNT" -gt 0 ] || { echo "❌ 一个 .ko 都没有：AK3 的 modules/ 会为空，安装器可能把整个 AK3 目录当模块推入系统，禁止继续"; exit 1; }
+          else
+            echo "❌ CONFIG_MODULES 未开启，但 lisa 的 AK3 里 do.modules=1；请换 AK3 或关掉 do.modules"
+            exit 1
+          fi
+
+          echo "===== 4) 产物自检 ====="
+          ls -l "$BOOT"/Image* "$BOOT"/dtb "$BOOT"/dtbo.img 2>/dev/null || true
+
+      - name: 🔩 Pack Process
+        uses: ./.github/workflows/pack-process
+
+      - name: ✏️ Upload Artifacts
+        uses: ./.github/workflows/upload-files
+
+# ============================================================================
+# 路线 A（备选，不推荐用在 A14 上）：MiCode 官方开源树
+#
+# 事实：MiCode/Xiaomi_Kernel_OpenSource 里 lisa 只有 lisa-r-oss 一个分支，
+#       是 Linux 5.4.86 的 Android 11 时代树，而且【不含】vendor DT 树
+#       （arch/arm64/boot/dts/vendor 不存在，vendor/qcom 返回 404），
+#       也【没有】独立 defconfig，只有 vendor/lisa_GKI.config + lisa_QGKI.config 两个片段，
+#       必须按官方 scripts/gki/generate_defconfig.sh 的配方现场合成
+#       （base=gki_defconfig → GKI片段(先 =m 改 =y) → QGKI片段 → debugfs.config）。
+#
+# 用在 A14 HyperOS 2 上的风险：A11 时代的内核与 A14 的 vendor 期望差距很大
+#       （vendor 模块/接口不匹配），非常可能开不了机；而且产物不含 dtb/dtbo。
+#
+# 用法（把 env 里 4 行替换掉，并把 defconfig 基座检查那段的判断条件保持不变）：
+#
+#   KERNEL_SOURCE : "https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git"
+#   KERNEL_BRANCH : "lisa-r-oss"
+#   DEFCONFIG_NAME : "gki_defconfig"
+#   MERGE_CONFIG_FILES: "vendor/lisa_ALLYES_GKI.config,vendor/lisa_QGKI.config,vendor/debugfs.config"
+#
+# 此时 Extra Kernel Options 里的第 1 步会自动生成 lisa_ALLYES_GKI.config。
+# ============================================================================
